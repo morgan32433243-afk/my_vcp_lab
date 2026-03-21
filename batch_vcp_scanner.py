@@ -676,25 +676,75 @@ if __name__ == "__main__":
         print("\n正在載入台股名冊供查詢對照...")
         tickers, ticker_industry_map, ticker_name_map = get_stock_list()
         print("\n進入手動輸入模式。")
+        # 建立名稱 → ticker 反查字典（小寫，支援模糊比對）
+        name_to_tickers = {}
+        for t, n in ticker_name_map.items():
+            key = n.strip().lower()
+            name_to_tickers.setdefault(key, []).append(t)
+
         while True:
-            ticker = input("請輸入股票代碼（純數字或加後綴，輸入 q 結束）：").upper()
-            if ticker == 'Q':
+            raw = input("請輸入股票代碼或公司名稱（輸入 q 結束）：").strip()
+            if raw.upper() == 'Q':
                 break
-                
-            search_ticker = ticker
-            if ticker.isdigit():
-                if f"{ticker}.TW" in ticker_industry_map:
-                    search_ticker = f"{ticker}.TW"
-                elif f"{ticker}.TWO" in ticker_industry_map:
-                    search_ticker = f"{ticker}.TWO"
-            
+
+            search_ticker = None
+
+            # 1) 純數字 → 自動加後綴
+            if raw.isdigit():
+                if f"{raw}.TW" in ticker_industry_map:
+                    search_ticker = f"{raw}.TW"
+                elif f"{raw}.TWO" in ticker_industry_map:
+                    search_ticker = f"{raw}.TWO"
+                else:
+                    search_ticker = raw  # 讓 analyze_vcp 自行嘗試
+
+            # 2) 已含後綴代碼 (如 2330.TW)
+            elif raw.upper() in ticker_industry_map:
+                search_ticker = raw.upper()
+
+            # 3) 公司名稱搜尋（模糊比對）
+            else:
+                query = raw.lower()
+                seen = set()
+                matches = []
+                # 比對公司名稱
+                for name_key, tklist in name_to_tickers.items():
+                    if query in name_key:
+                        for t in tklist:
+                            if t not in seen:
+                                seen.add(t)
+                                matches.append(t)
+                # 比對產業別（例如搜尋「半導體」→ 找出所有半導體業）
+                for t, ind_val in ticker_industry_map.items():
+                    if query in ind_val.lower() and t not in seen:
+                        seen.add(t)
+                        matches.append(t)
+
+                if not matches:
+                    print(f"❌ 找不到『{raw}』，請確認代碼或公司名稱後重試。\n")
+                    continue
+                elif len(matches) == 1:
+                    search_ticker = matches[0]
+                else:
+                    print(f"🔍 找到 {len(matches)} 個符合『{raw}』的公司：")
+                    for i, t in enumerate(matches, 1):
+                        n   = ticker_name_map.get(t, '')
+                        ind = ticker_industry_map.get(t, '')
+                        print(f"  {i:>2}. {t:<14} {n} ({ind})")
+                    sel = input("請輸入編號選擇（直接 Enter 取消）：").strip()
+                    if not sel.isdigit() or not (1 <= int(sel) <= len(matches)):
+                        print("已取消。\n")
+                        continue
+                    search_ticker = matches[int(sel) - 1]
+
             if search_ticker in ticker_industry_map:
                 name = ticker_name_map.get(search_ticker, '未知名稱')
                 ind  = ticker_industry_map.get(search_ticker, '未知產業')
                 print(f"\n🏷️ 查詢標的：{search_ticker} {name} ({ind})")
-                
+
             analyze_vcp(search_ticker, silent=False)
             print("  👴🏿 祝您發大財！👴🏿\n")
+
 
 
 
