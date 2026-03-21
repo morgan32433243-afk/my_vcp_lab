@@ -1,7 +1,7 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
 import warnings
 import os
 import ssl
@@ -10,13 +10,12 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 os.environ['PYTHONHTTPSVERIFY'] = '0'
 
-# 隱藏所有警告，包括 matplotlib 的字體警告
 warnings.filterwarnings('ignore')
 
-def calculate_recent_pullbacks(df, lookback=120, order=5):
+def calculate_recent_pullbacks(df, lookback=140, order=5):
     """
     計算最近幾波的回檔深度 (波峰到波谷)
-    order: 波峰/波谷的左右區間大小
+    lookback: 約 20 週 (140 個交易日)，符合 VCP 理論的時間窗限制
     """
     if len(df) < lookback:
         df_recent = df
@@ -50,211 +49,281 @@ def calculate_recent_pullbacks(df, lookback=120, order=5):
         
     return recent_3, is_decreasing
 
-def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
+
+def calculate_ud_volume_ratio(data, lookback=50):
+    """
+    計算 U/D Volume Ratio (上漲日總量 / 下跌日總量)
+    > 1.0 代表多頭吃貨痕跡
+    """
+    df = data.iloc[-lookback:].copy()
+    df['price_change'] = df['Close'].diff()
+    up_vol = df[df['price_change'] > 0]['Volume'].sum()
+    down_vol = df[df['price_change'] < 0]['Volume'].sum()
+    if down_vol == 0:
+        return 999.0  # 無下跌日，極端多頭
+    return round(up_vol / down_vol, 2)
+
+
+def analyze_vcp(ticker_symbol, silent=False):
     original_ticker = ticker_symbol
-    # 抓取數據：使用 yfinance 抓取單一美股或台股過去 250 天的歷史數據。
     end_date = datetime.now()
-    # 獲取約 375 天的數據以確保有足夠的 250 個交易日來計算移動平均線
-    start_date = end_date - timedelta(days=250 * 1.5)
+    start_date = end_date - timedelta(days=int(250 * 1.6))
 
-    data = pd.DataFrame() # 初始化空的 DataFrame
+    data = pd.DataFrame()
 
-    # 自動修正格式：如果輸入是純數字（台股代號），請自動幫我補上 .TW 或 .TWO 後綴並嘗試抓取
+    # 自動修正格式：純數字台股代號自動嘗試 .TW 再 .TWO
     if ticker_symbol.isdigit():
         ticker_tw = ticker_symbol + ".TW"
         ticker_two = ticker_symbol + ".TWO"
-        
-        final_ticker = None # 用於儲存成功抓取數據的股票代碼
+        final_ticker = None
 
-        # 嘗試 .TW (上市)
         if not silent: print(f"嘗試分析股票: {ticker_tw}")
         try:
-            data = yf.download(ticker_tw, start=start_date, end=end_date, progress=False)
+            import io, contextlib
+            _b = io.StringIO()
+            ctx = contextlib.redirect_stderr(_b) if silent else contextlib.nullcontext()
+            with ctx:
+                data = yf.download(ticker_tw, start=start_date, end=end_date, progress=False)
             if not data.empty:
                 final_ticker = ticker_tw
         except Exception:
-            pass # 忽略第一次下載的錯誤
+            pass
 
-        # 如果 .TW 失敗或數據為空，則嘗試 .TWO (上櫃)
         if data.empty:
             if not silent: print(f"嘗試分析股票: {ticker_two}")
             try:
-                data = yf.download(ticker_two, start=start_date, end=end_date, progress=False)
+                _b = io.StringIO()
+                ctx = contextlib.redirect_stderr(_b) if silent else contextlib.nullcontext()
+                with ctx:
+                    data = yf.download(ticker_two, start=start_date, end=end_date, progress=False)
                 if not data.empty:
                     final_ticker = ticker_two
             except Exception:
-                pass # 忽略第二次下載的錯誤
+                pass
 
-        # 如果兩次都失敗
         if data.empty:
-            if not silent: print(f"錯誤: 無法抓取 {original_ticker} (或其 .TW/.TWO 變體) 的數據。請檢查股票代碼是否正確。")
-            return None # 返回 None 表示失敗
+            if not silent: print(f"錯誤: 無法抓取 {original_ticker} 的數據。")
+            return None
         else:
-            # 更新 ticker_symbol 為成功抓取的代碼
             ticker_symbol = final_ticker
-            if not silent: print(f"成功分析股票: {ticker_symbol}") # 顯示最終分析的股票代碼
+            if not silent: print(f"成功分析股票: {ticker_symbol}")
 
-    else: # 如果不是純數字，則直接使用原始輸入
+    else:
         if not silent: print(f"分析股票: {ticker_symbol}")
         try:
-            data = yf.download(ticker_symbol, start=start_date, end=end_date, progress=False)
+            import io, contextlib
+            _b = io.StringIO()
+            ctx = contextlib.redirect_stderr(_b) if silent else contextlib.nullcontext()
+            with ctx:
+                data = yf.download(ticker_symbol, start=start_date, end=end_date, progress=False)
         except Exception:
-            if not silent: print(f"抓取 {ticker_symbol} 數據時發生未預期錯誤。請稍後再試或檢查網路連線。")
-            return None # 返回 None 表示失敗
+            if not silent: print(f"抓取 {ticker_symbol} 數據時發生未預期錯誤。")
+            return None
         if data.empty:
-            if not silent: print(f"錯誤: 無法抓取 {ticker_symbol} 的數據。請檢查股票代碼是否正確。")
-            return None # 返回 None 表示失敗
+            if not silent: print(f"錯誤: 無法抓取 {ticker_symbol} 的數據。")
+            return None
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.droplevel(1)
 
-    # 確保有足夠的數據來計算 200MA 和平均成交量
     if len(data) < 200:
         if not silent: print(f"數據不足以計算移動平均線，目前只有 {len(data)} 天數據。")
-        return None # 返回 None 表示數據不足
+        return None
 
-    # 計算移動平均線、平均成交量和累積動能相關數據
+    # 移動平均線
     data['200MA'] = data['Close'].rolling(window=200).mean()
     data['150MA'] = data['Close'].rolling(window=150).mean()
-    data['50MA'] = data['Close'].rolling(window=50).mean()
-    data['Vol_5_MA'] = data['Volume'].rolling(window=5).mean() # 近5日平均成交量
-    data['Vol_20_MA'] = data['Volume'].rolling(window=20).mean() # 近20日平均成交量
+    data['50MA']  = data['Close'].rolling(window=50).mean()
+    data['20MA']  = data['Close'].rolling(window=20).mean()
+    data['10MA']  = data['Close'].rolling(window=10).mean()
+    data['5MA']   = data['Close'].rolling(window=5).mean()
+    data['Vol_20_MA'] = data['Volume'].rolling(window=20).mean()
+    data['Vol_5_MA']  = data['Volume'].rolling(window=5).mean()
 
-    # 計算成交額、5日與50日均成交額 (雙軌流動性)
+    # 成交金額
     data['Turnover'] = data['Close'] * data['Volume']
     data['Turnover_5_MA'] = data['Turnover'].rolling(window=5).mean()
     data['Turnover_50_MA'] = data['Turnover'].rolling(window=50).mean()
 
-    # 獲取最新的數據點並明確提取為純數值
-    latest_close = data['Close'].iloc[-1].item()
-    latest_200MA = data['200MA'].iloc[-1].item()
-    latest_150MA = data['150MA'].iloc[-1].item()
-    latest_50MA = data['50MA'].iloc[-1].item()
-    latest_vol_5_ma = data['Vol_5_MA'].iloc[-1].item()
-    latest_vol_20_ma = data['Vol_20_MA'].iloc[-1].item()
+    latest_close   = data['Close'].iloc[-1].item()
+    latest_200MA   = data['200MA'].iloc[-1].item()
+    latest_150MA   = data['150MA'].iloc[-1].item()
+    latest_50MA    = data['50MA'].iloc[-1].item()
+    latest_20MA    = data['20MA'].iloc[-1].item()
+    latest_10MA    = data['10MA'].iloc[-1].item()
+    latest_5MA     = data['5MA'].iloc[-1].item()
+    latest_vol_5_ma    = data['Vol_5_MA'].iloc[-1].item()
+    latest_vol_20_ma   = data['Vol_20_MA'].iloc[-1].item()
     latest_turnover_50_ma = data['Turnover_50_MA'].iloc[-1].item()
-    latest_turnover_5_ma = data['Turnover_5_MA'].iloc[-1].item()
+    latest_turnover_5_ma  = data['Turnover_5_MA'].iloc[-1].item()
 
-    # 計算流動性
     is_liquid = (latest_turnover_50_ma > 30_000_000) and (latest_turnover_5_ma > 50_000_000)
 
-    # 取得 5 日前的收盤價，用於買盤動能判斷
-    price_5_days_ago = None
-    if len(data) >= 5:
-        price_5_days_ago = data['Close'].iloc[-5].item()
+    price_5_days_ago = data['Close'].iloc[-5].item() if len(data) >= 5 else None
 
-    # 檢查關鍵數據點是否為 NaN
     if pd.isna(latest_200MA) or pd.isna(latest_150MA) or pd.isna(latest_50MA) or \
        pd.isna(latest_vol_5_ma) or pd.isna(latest_vol_20_ma) or price_5_days_ago is None:
         if not silent: print("移動平均線、成交量或價格數據不足以進行完整分析。")
-        return None # 返回 None 表示數據不足
+        return None
 
-    # 計算 250 日最高/最低價
     highest_250_day_price = data['High'].iloc[-250:].max().item()
-    lowest_250_day_price = data['Low'].iloc[-250:].min().item()
+    lowest_250_day_price  = data['Low'].iloc[-250:].min().item()
 
-    # 計算 20天前的 200MA
     ma200_series = data['200MA'].dropna()
     ma200_20_days_ago = ma200_series.iloc[-20].item() if len(ma200_series) >= 20 else None
 
-    # 現在比較的是純數字，不會有 Series 標籤對齊問題
-    # 嚴格趨勢檢查：確保符合 Close > 50MA > 150MA > 200MA 的多頭排列
+    # ===========================================================
+    # 均線多頭排列診斷：逐條檢查 Close > 5MA > 10MA > 20MA > 50MA > 150MA > 200MA
+    # ===========================================================
+    ma_chain = [
+        ("Close",  latest_close),
+        ("5MA",    latest_5MA),
+        ("10MA",   latest_10MA),
+        ("20MA",   latest_20MA),
+        ("50MA",   latest_50MA),
+        ("150MA",  latest_150MA),
+        ("200MA",  latest_200MA),
+    ]
+    ma_broken = []  # 未達標的連結
+    for k in range(len(ma_chain) - 1):
+        name_a, val_a = ma_chain[k]
+        name_b, val_b = ma_chain[k + 1]
+        if not (val_a > val_b):
+            ma_broken.append(f"{name_a} < {name_b}")
+
+
+    # 核心趨勢定義：至少需要 Close > 50MA > 150MA > 200MA
     is_uptrend = (latest_close > latest_50MA > latest_150MA > latest_200MA)
 
     if not silent:
-        if not is_uptrend:
-            print(f"股票 {ticker_symbol} 不符合上升趨勢或相對強度條件。")
-            print(f"  最新收盤價: {latest_close:.2f}")
-            print(f"  50MA: {latest_50MA:.2f}")  # 顯示 50MA
-            print(f"  150MA: {latest_150MA:.2f}")
-            print(f"  200MA: {latest_200MA:.2f}")
-            print(f"  250日最高價: {highest_250_day_price:.2f}")
+        print("\n均線多頭排列診斷 (Close > 5MA > 10MA > 20MA > 50MA > 150MA > 200MA):")
+        if not ma_broken:
+            print("  ✅ 全部均線完美多頭排列！")
         else:
-            print(f"股票 {ticker_symbol} 符合上升趨勢與相對強度條件。")
-            print(f"  最新收盤價: {latest_close:.2f}")
-            print(f"  50MA: {latest_50MA:.2f}")  # 顯示 50MA
-            print(f"  150MA: {latest_150MA:.2f}")
-            print(f"  200MA: {latest_200MA:.2f}")
-            print(f"  250日最高價: {highest_250_day_price:.2f}")
+            print(f"  ✅ 達標連結: {len(ma_chain)-1 - len(ma_broken)}/{len(ma_chain)-1}")
+            for broken in ma_broken:
+                print(f"  ❌ 未達標: {broken}")
+        ma_vals = " | ".join([f"{n}:{v:.2f}" for n, v in ma_chain])
+        print(f"  📊 {ma_vals}")
 
-    # VCP 型態偵測：找出過去 20 個交易日內，價格波動（High-Low 的百分比）是否呈現逐漸縮小的趨勢（收縮型態）。
-    # 計算每日波動百分比
-    import numpy as np
+    # U/D Volume Ratio (近 50 日)
+    ud_ratio = calculate_ud_volume_ratio(data, lookback=50)
+
+    # VCP 波動率計算
     data['Volatility'] = ((data['High'] - data['Low']) / data['Close']) * 100
     data['Volatility'] = data['Volatility'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
-    # 考慮過去 20 個交易日的波動數據
     last_20_days_volatility = data['Volatility'].iloc[-20:].dropna()
 
-    if len(last_20_days_volatility) < 2: # 至少需要 2 天數據才能比較波動
+    if len(last_20_days_volatility) < 2:
         if not silent: print("過去 20 個交易日數據不足以分析 VCP 型態。")
-        return None # 返回 None 表示數據不足
+        return None
 
-    # 計算收縮次數 (T) 和記錄收縮波動百分比 (包含日期)
     T_count = 0
-    # 修改：用於儲存每次收縮時的 (日期, 波動百分比)
-    contraction_points = [] 
+    contraction_points = []
 
     for i in range(1, len(last_20_days_volatility)):
         if last_20_days_volatility.iloc[i] < last_20_days_volatility.iloc[i-1]:
             T_count += 1
-            # 記錄當前收縮時的 (日期, 波動百分比)
             contraction_points.append((last_20_days_volatility.index[i], last_20_days_volatility.iloc[i]))
 
-    # 目前的波動百分比
     current_volatility_percentage = last_20_days_volatility.iloc[-1]
 
-    # 計算 Volume Dry Up (VDU)
-    # 在最後一次收縮處，成交量必須低於過去 20 天平均量的 50%
+    # VDU：最後一次收縮日成交量 < 20MA 的 40%，且收盤必須在當日區間的上半段
+    # 確保縮量是在「撐住」而非「陰跌」
     is_vdu = False
     vdu_vol_ratio = None
+    vdu_close_position = None  # 收盤位置 (0=底部, 1=頂部)
     if contraction_points:
         last_contraction_date, _ = contraction_points[-1]
         if last_contraction_date in data.index:
-            last_vol = data['Volume'].loc[last_contraction_date]
+            last_vol      = data['Volume'].loc[last_contraction_date]
             last_vol_20ma = data['Vol_20_MA'].loc[last_contraction_date]
-            if hasattr(last_vol, "item"): last_vol = last_vol.item()
+            last_close    = data['Close'].loc[last_contraction_date]
+            last_high     = data['High'].loc[last_contraction_date]
+            last_low      = data['Low'].loc[last_contraction_date]
+            for v in [last_vol, last_vol_20ma, last_close, last_high, last_low]:
+                if hasattr(v, "item"): v = v.item()
+            if hasattr(last_vol, "item"):      last_vol = last_vol.item()
             if hasattr(last_vol_20ma, "item"): last_vol_20ma = last_vol_20ma.item()
+            if hasattr(last_close, "item"):    last_close = last_close.item()
+            if hasattr(last_high, "item"):     last_high = last_high.item()
+            if hasattr(last_low, "item"):      last_low = last_low.item()
             if not pd.isna(last_vol) and not pd.isna(last_vol_20ma) and last_vol_20ma > 0:
                 vdu_vol_ratio = last_vol / last_vol_20ma
-                if vdu_vol_ratio < 0.5:
+                day_range = last_high - last_low
+                # 收盤位置：0 = 日低點，1 = 日高點
+                if day_range > 0:
+                    vdu_close_position = (last_close - last_low) / day_range
+                else:
+                    vdu_close_position = 0.5  # 無實體K棒視為中性
+                # 窒息量標準：成交量 < 40% 且收盤在區間上半段 (≥ 50%)
+                close_in_upper = vdu_close_position >= 0.5
+                if vdu_vol_ratio < 0.40 and close_in_upper:
                     is_vdu = True
 
-    # 計算最近三波的回檔深度並驗證遞減規則
+
     recent_pullbacks, pullbacks_decreasing = calculate_recent_pullbacks(data)
 
     if not silent:
-        # 顯示結果：列印出計算出的收縮次數（T）與目前的波動百分比。
         print(f"\nVCP 型態偵測 (過去 {len(last_20_days_volatility)} 個交易日):")
         print(f"  收縮次數 (T): {T_count}")
         print(f"  目前的波動百分比: {current_volatility_percentage:.2f}%")
+        print(f"  U/D Volume Ratio (近50日): {ud_ratio:.2f}")
+        print(f"  VDU 量比: {f'{vdu_vol_ratio:.2f}' if vdu_vol_ratio is not None else '無資料'} ({'✅ 窒息量' if is_vdu else '❌ 量能未枯竭'})")
 
-        # VCP 邏輯加強：如果檢測到股價正在處於『波動收縮』階段，計算最近三波的高低差比例。
-        if T_count > 0: # 只有在有收縮發生時才顯示此信息
-            if len(contraction_points) >= 3: # contraction_volatility_levels 替換為 contraction_points
-                print("  最近三波波動收縮比例 (由最新往回): ", end="")
-                # 取得最後三波收縮的波動百分比
-                last_three_contractions_values = [f"{v[1]:.2f}%" for v in contraction_points[-3:]] # 提取數值部分
+        if T_count > 0:
+            if len(contraction_points) >= 3:
+                print("  最近三波波動收縮比例 (由最舊到最新): ", end="")
+                last_three_contractions_values = [f"{v[1]:.2f}%" for v in contraction_points[-3:]]
                 print(" -> ".join(last_three_contractions_values))
-            elif len(contraction_points) > 0: # contraction_volatility_levels 替換為 contraction_points
+            elif len(contraction_points) > 0:
                 print(f"  已檢測到 {len(contraction_points)} 波波動收縮。")
-                print("  所有波動收縮比例: ", end="")
-                all_contractions_values = [f"{v[1]:.2f}%" for v in contraction_points] # 提取數值部分
-                print(" -> ".join(all_contractions_values))
+                print("  所有波動收縮比例 (由最舊到最新): ", end="")
+                print(" -> ".join([f"{v[1]:.2f}%" for v in contraction_points]))
         else:
             print("  未檢測到波動收縮階段。")
 
-        # 新增的波動收縮小於 2% 的提醒
-        if current_volatility_percentage < 2.0:
-            print("\n" + "⭐⭐⭐" * 5) # 大大的星星
-            print("高度關注！洗盤可能已結束，型態極度緊縮。")
-            print("⭐⭐⭐" * 5 + "\n")
+        # 分級提示 (更新為 2.5% 臨界點)
+        if current_volatility_percentage < 2.5:
+            print("\n" + "🔥" * 8)
+            print("VCP 緊縮臨界點！洗盤已極度乾淨，隨時準備引爆！")
+            print("🔥" * 8 + "\n")
+        elif current_volatility_percentage < 7.0:
+            print("  ✨ 高度關注：VCP 緊縮程度佳 (< 7%)")
 
-        # 最後輸出一句：祝劉先生在投資路上穩定獲利！
+    # ===========================================================
+    # 突破偵測：Pivot Point = VCP 盤整區間最高點 (Recent 14 日)
+    # ===========================================================
+    vcp_window = 14
+    pivot_point = data['High'].iloc[-vcp_window:].max().item()
+
+    today_vol = data['Volume'].iloc[-1].item()
+    breakout_vol_ratio = today_vol / latest_vol_20_ma if latest_vol_20_ma > 0 else 0
+
+    # 突破判定：收盤 > Pivot 且 量能 >= 200%
+    is_breakout = (latest_close > pivot_point) and (breakout_vol_ratio >= 2.0)
+    # 假突破：盤中曾突破 (最高價 > Pivot) 但收盤跌回區間內
+    is_false_breakout = (data['High'].iloc[-1].item() > pivot_point) and (latest_close <= pivot_point)
+
+    if not silent:
+        print(f"\n  🎯 Pivot Point (VCP 盤整最高點): {pivot_point:.2f}")
+        if is_breakout:
+            print(f"  🚀 【已突破！】放量 {breakout_vol_ratio*100:.0f}%，收盤 {latest_close:.2f} 超越 Pivot {pivot_point:.2f}")
+        elif is_false_breakout:
+            print(f"  ⚠️  【假突破！】盤中曾衝破 Pivot，但收盤跌回 {latest_close:.2f}，需觀察")
+        else:
+            vol_needed = latest_vol_20_ma * 2
+            print(f"  ⏳ 尚未突破，條件：收盤 > {pivot_point:.2f} 且成交量 ≥ {vol_needed:,.0f} 張 (20日均量×200%，今日僅達 {breakout_vol_ratio*100:.0f}%)")
+
+
+
+
     results = {
         "ticker": ticker_symbol,
         "is_vdu": is_vdu,
         "vdu_vol_ratio": vdu_vol_ratio,
+        "vdu_close_position": vdu_close_position,
         "recent_pullbacks": recent_pullbacks,
         "pullbacks_decreasing": pullbacks_decreasing,
         "current_price": latest_close,
@@ -274,97 +343,21 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
         "ma200": latest_200MA,
         "ma200_20_days_ago": ma200_20_days_ago,
         "turnover_5_ma": latest_turnover_5_ma,
-        "turnover_50_ma": latest_turnover_50_ma
+        "turnover_50_ma": latest_turnover_50_ma,
+        "ud_ratio": ud_ratio,
+        # 突破訊號
+        "pivot_point": pivot_point,
+        "is_breakout": is_breakout,
+        "is_false_breakout": is_false_breakout,
+        "breakout_vol_ratio": breakout_vol_ratio,
     }
 
-    # 繪圖引擎：由外部決定是否傳入 output_filename，有傳入即無條件繪圖
-    if output_filename and not data.empty:
-        # 只有符合條件才執行繪圖
-        fig, (ax_price, ax_vol) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
-
-        ax_price.plot(data.index, data['Close'], label='Close Price', color='black', linewidth=1.5)
-        ax_price.plot(data.index, data['50MA'], label='50MA', color='blue', linestyle='--')
-        ax_price.plot(data.index, data['150MA'], label='150MA', color='orange', linestyle='--')
-        ax_price.plot(data.index, data['200MA'], label='200MA', color='red', linestyle='--')
-
-        # VCP 收縮三角形視覺化
-        if contraction_points:
-            start_date = contraction_points[0][0]
-            end_date = data.index[-1]
-            vcp_data = data.loc[start_date:end_date]
-            if len(vcp_data) > 1:
-                x_coords = [start_date, end_date]
-                
-                max_high = vcp_data['High'].max()
-                min_low = vcp_data['Low'].min()
-                if hasattr(max_high, "item"): max_high = max_high.item()
-                if hasattr(min_low, "item"): min_low = min_low.item()
-                
-                y_upper = [max_high, latest_close]
-                y_lower = [min_low, latest_close]
-                ax_price.fill_between(x_coords, y_lower, y_upper, color='gray', alpha=0.2, lw=0)
-
-        # 標註最後三波收縮區間
-        if len(contraction_points) >= 3:
-            last_three_contraction_points = contraction_points[-3:]
-            
-            # 從最舊的收縮點開始標註
-            for i, (date, vol_pct) in enumerate(last_three_contraction_points):
-                # 為了標註一整天，我們從收縮日期的開始到結束
-                ax_price.axvspan(date - timedelta(hours=12), date + timedelta(hours=12), color='lightgreen', alpha=0.3, lw=0)
-                # 在日期附近標註百分比，稍微偏移以避免重疊
-                ax_price.text(date, ax_price.get_ylim()[1] * (0.95 - i*0.02), f"{vol_pct:.2f}%", 
-                        color='darkgreen', fontsize=9, ha='center', va='top')
-            
-        ax_price.set_title(f"{ticker_symbol} Price Trend and VCP Analysis", fontsize=16)
-        ax_price.set_ylabel("Price", fontsize=12)
-        ax_price.legend(loc='upper left')
-        ax_price.grid(True, linestyle='--', alpha=0.6)
-
-        # 繪製成交量子圖 (紅漲綠跌)
-        if 'Open' in data.columns:
-            colors = ['red' if c >= o else 'green' for c, o in zip(data['Close'], data['Open'])]
-        else:
-            colors = ['red' if i == 0 or data['Close'].iloc[i] >= data['Close'].iloc[i-1] else 'green' for i in range(len(data))]
-            
-        ax_vol.bar(data.index, data['Volume'], color=colors, alpha=0.7)
-        ax_vol.set_ylabel("Volume", fontsize=12)
-        ax_vol.set_xlabel("Date", fontsize=12)
-        ax_vol.grid(True, linestyle='--', alpha=0.6)
-
-        # 若為 VDU 狀態，在最後一次收縮處標記 VDU (量縮窒息)
-        if is_vdu and contraction_points:
-            vdu_date = contraction_points[-1][0]
-            if vdu_date in data.index:
-                vdu_vol = data['Volume'].loc[vdu_date]
-                if hasattr(vdu_vol, "item"): vdu_vol = vdu_vol.item()
-                ax_vol.annotate('VDU', xy=(vdu_date, vdu_vol), xytext=(0, 25),
-                                textcoords='offset points', ha='center', va='bottom',
-                                arrowprops=dict(facecolor='blue', shrink=0.05, width=1.5, headwidth=6),
-                                fontsize=10, color='blue', fontweight='bold',
-                                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="blue", alpha=0.8))
-
-        # 格式化x軸日期
-        fig.autofmt_xdate()
-
-        plt.tight_layout()
-        plt.savefig(output_filename)
-        plt.clf()
-        plt.close('all')
-        import gc; gc.collect()
-        if not silent: print(f"\n股價走勢圖已儲存為 {output_filename}")
-        
     return results
+
 
 if __name__ == "__main__":
     while True:
         ticker = input("請輸入股票代碼（輸入 q 結束）：").upper()
         if ticker == 'Q':
             break
-        # 在交互模式下，不靜默輸出，並將圖表保存到手動模式專用目錄
-        output_dir_manual = "vcp_plots_manual"
-        if not os.path.exists(output_dir_manual):
-            os.makedirs(output_dir_manual)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plot_filename = os.path.join(output_dir_manual, f"vcp_plot_{ticker}_{timestamp}.png")
-        analyze_vcp(ticker, output_filename=plot_filename, silent=False)
+        analyze_vcp(ticker, silent=False)
