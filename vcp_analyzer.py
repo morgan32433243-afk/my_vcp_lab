@@ -12,6 +12,16 @@ os.environ['PYTHONHTTPSVERIFY'] = '0'
 
 warnings.filterwarnings('ignore')
 
+def format_vcp_amount(amt):
+    if amt is None or np.isnan(amt): return "N/A"
+    if amt >= 100000000:
+        return f"{amt/100000000:.2f} 億"
+    elif amt >= 10000:
+        return f"{amt/10000:.0f} 萬"
+    else:
+        return f"{int(amt)}"
+
+
 def calculate_recent_pullbacks(df, lookback=140, order=5):
     """
     計算最近幾波的回檔深度 (波峰到波谷)
@@ -64,7 +74,7 @@ def calculate_ud_volume_ratio(data, lookback=50):
     return round(up_vol / down_vol, 2)
 
 
-def analyze_vcp(ticker_symbol, silent=False):
+def analyze_vcp(ticker_symbol, silent=False, revenue_info=None, eps_info=None):
     original_ticker = ticker_symbol
     end_date = datetime.now()
     start_date = end_date - timedelta(days=int(250 * 1.6))
@@ -173,10 +183,10 @@ def analyze_vcp(ticker_symbol, silent=False):
     ma200_20_days_ago = ma200_series.iloc[-20].item() if len(ma200_series) >= 20 else None
 
     # ===========================================================
-    # 均線多頭排列診斷：逐條檢查 Close > 5MA > 10MA > 20MA > 50MA > 150MA > 200MA
+    # 均線多頭排列診斷：逐條檢查 收盤價 > 5MA > 10MA > 20MA > 50MA > 150MA > 200MA
     # ===========================================================
     ma_chain = [
-        ("Close",  latest_close),
+        ("收盤價",  latest_close),
         ("5MA",    latest_5MA),
         ("10MA",   latest_10MA),
         ("20MA",   latest_20MA),
@@ -192,11 +202,11 @@ def analyze_vcp(ticker_symbol, silent=False):
             ma_broken.append(f"{name_a} < {name_b}")
 
 
-    # 核心趨勢定義：至少需要 Close > 50MA > 150MA > 200MA
+    # 核心趨勢定義：至少需要 收盤價 > 50MA > 150MA > 200MA
     is_uptrend = (latest_close > latest_50MA > latest_150MA > latest_200MA)
 
     if not silent:
-        print("\n均線多頭排列診斷 (Close > 5MA > 10MA > 20MA > 50MA > 150MA > 200MA):")
+        print("\n均線多頭排列診斷 (收盤價 > 5MA > 10MA > 20MA > 50MA > 150MA > 200MA):")
         if not ma_broken:
             print("  ✅ 全部均線完美多頭排列！")
         else:
@@ -205,6 +215,23 @@ def analyze_vcp(ticker_symbol, silent=False):
                 print(f"  ❌ 未達標: {broken}")
         ma_vals = " | ".join([f"{n}:{v:.2f}" for n, v in ma_chain])
         print(f"  📊 {ma_vals}")
+
+        if revenue_info or eps_info:
+            print("\n📈 基本面 (Fundamental) 分析:")
+            if revenue_info:
+                yoy, is_accel, msg = revenue_info
+                if msg == "LIMIT_EXCEEDED":
+                    print("  💰 營收成長: 暫無資料 (FinMind API 呼叫達上限)")
+                else:
+                    accel_tag = " (🚀營收加速中)" if is_accel else ""
+                    print(f"  💰 營收成長: {msg}{accel_tag}")
+            if eps_info:
+                eps_yoy, margins_improving, msg = eps_info
+                if msg == "LIMIT_EXCEEDED":
+                    print("  📊 EPS 成長: 暫無資料 (FinMind API 呼叫達上限)")
+                else:
+                    margin_tag = " (💎三率拉升中)" if margins_improving else ""
+                    print(f"  📊 EPS 成長: {msg}{margin_tag}")
 
     # U/D Volume Ratio (近 50 日)
     ud_ratio = calculate_ud_volume_ratio(data, lookback=50)
@@ -286,35 +313,52 @@ def analyze_vcp(ticker_symbol, silent=False):
 
         # 分級提示 (更新為 2.5% 臨界點)
         if current_volatility_percentage < 2.5:
-            print("\n" + "🔥" * 8)
-            print("VCP 緊縮臨界點！洗盤已極度乾淨，隨時準備引爆！")
-            print("🔥" * 8 + "\n")
+            print("  🔥🔥🔥 VCP 緊縮臨界點！洗盤已極度乾淨，隨時準備引爆！🔥🔥🔥")
         elif current_volatility_percentage < 7.0:
             print("  ✨ 高度關注：VCP 緊縮程度佳 (< 7%)")
 
     # ===========================================================
-    # 突破偵測：Pivot Point = VCP 盤整區間最高點 (Recent 14 日)
+    # 突破偵測：
+    # 1. 傳統突破點 (Base High)：過去 50 日最高點
+    # 2. 中繼作弊點 (Cheat Pivot)：最後一次收縮的局部高點 (近 14 日最高峰)
     # ===========================================================
-    vcp_window = 14
-    pivot_point = data['High'].iloc[-vcp_window:].max().item()
+    base_high = data['High'].iloc[-50:].max().item() if len(data) >= 50 else data['High'].max().item()
+    cheat_pivot = data['High'].iloc[-14:].max().item()
 
     today_vol = data['Volume'].iloc[-1].item()
+    today_amount = latest_close * today_vol
+    latest_amount_20_ma = (data['Close'] * data['Volume']).rolling(20).mean().iloc[-1].item()
     breakout_vol_ratio = today_vol / latest_vol_20_ma if latest_vol_20_ma > 0 else 0
+    
+    prev_close = data['Close'].iloc[-2].item() if len(data) >= 2 else latest_close
+    daily_change_pct = (latest_close / prev_close - 1) * 100
 
-    # 突破判定：收盤 > Pivot 且 量能 >= 200%
-    is_breakout = (latest_close > pivot_point) and (breakout_vol_ratio >= 2.0)
-    # 假突破：盤中曾突破 (最高價 > Pivot) 但收盤跌回區間內
-    is_false_breakout = (data['High'].iloc[-1].item() > pivot_point) and (latest_close <= pivot_point)
+    # 1. 傳統突破判定：收盤 > Base High 且 量能 >= 200%
+    is_traditional_breakout = (latest_close > base_high) and (breakout_vol_ratio >= 2.0)
+    
+    # 2. 中繼作弊點 (The Cheat)：收盤越過局部高點，量能 > 20MA (100%)，單日漲幅 > 3%
+    is_cheat_breakout = (latest_close > cheat_pivot) and (breakout_vol_ratio > 1.0) and (daily_change_pct > 3.0)
+    
+    # 假突破：盤中曾突破局部高點，但收盤跌回區間內
+    is_false_breakout = (data['High'].iloc[-1].item() > cheat_pivot) and (latest_close <= cheat_pivot)
 
     if not silent:
-        print(f"\n  🎯 Pivot Point (VCP 盤整最高點): {pivot_point:.2f}")
-        if is_breakout:
-            print(f"  🚀 【已突破！】放量 {breakout_vol_ratio*100:.0f}%，收盤 {latest_close:.2f} 超越 Pivot {pivot_point:.2f}")
+        print(f"\n  🎯 中繼作弊點 (Cheat Pivot): {cheat_pivot:.2f} | 傳統大底高點 (Base High): {base_high:.2f}")
+        if is_traditional_breakout:
+            print(f"  🚀 【強勢突破大底！】成交量 {format_vcp_amount(today_amount)} / {today_vol:,.0f}張 ({breakout_vol_ratio*100:.0f}%)，收盤 {latest_close:.2f} 超越傳統高點 {base_high:.2f}")
+        elif is_cheat_breakout:
+            print(f"  🎯 【作弊點 (The Cheat) 觸發！】漲幅 {daily_change_pct:.1f}%，成交量 {format_vcp_amount(today_amount)} / {today_vol:,.0f}張 ({breakout_vol_ratio*100:.0f}%)，成功越過局部高點 {cheat_pivot:.2f}！")
         elif is_false_breakout:
-            print(f"  ⚠️  【假突破！】盤中曾衝破 Pivot，但收盤跌回 {latest_close:.2f}，需觀察")
+            print(f"  ⚠️  【假突破！】盤中曾衝破局部高點，但收盤跌回 {latest_close:.2f}，需觀察")
         else:
-            vol_needed = latest_vol_20_ma * 2
-            print(f"  ⏳ 尚未突破，條件：收盤 > {pivot_point:.2f} 且成交量 ≥ {vol_needed:,.0f} 張 (20日均量×200%，今日僅達 {breakout_vol_ratio*100:.0f}%)")
+            print(f"  ⏳ 尚未突破作弊點 (Cheat Pivot)，進度追蹤：")
+            cond1 = "✅" if latest_close > cheat_pivot else "❌"
+            cond2 = "✅" if daily_change_pct > 3.0 else "❌"
+            cond3 = "✅" if breakout_vol_ratio > 1.0 else "❌"
+            print(f"     {cond1} 收盤價 {latest_close:.2f} > 局部高點 {cheat_pivot:.2f}")
+            print(f"     {cond2} 單日漲幅 {daily_change_pct:.1f}% > 3.0%")
+            print(f"     {cond3} 金額 {format_vcp_amount(today_amount)} > 20日均額 {format_vcp_amount(latest_amount_20_ma)}")
+            print(f"     {cond3} 張數 {today_vol:,.0f} {breakout_vol_ratio*100:.0f}% > 20日均量 {latest_vol_20_ma:,.0f}")
 
 
 
@@ -334,6 +378,9 @@ def analyze_vcp(ticker_symbol, silent=False):
         "price_5_days_ago": price_5_days_ago,
         "current_volatility_percentage": current_volatility_percentage,
         "t_count": T_count,
+        "today_vol": today_vol,
+        "today_amount": today_amount,
+        "avg_amount_20": latest_amount_20_ma,
         "is_uptrend": is_uptrend,
         "is_liquid": is_liquid,
         "is_safe_liquidity": is_liquid,
@@ -346,8 +393,10 @@ def analyze_vcp(ticker_symbol, silent=False):
         "turnover_50_ma": latest_turnover_50_ma,
         "ud_ratio": ud_ratio,
         # 突破訊號
-        "pivot_point": pivot_point,
-        "is_breakout": is_breakout,
+        "cheat_pivot": cheat_pivot,
+        "base_high": base_high,
+        "is_traditional_breakout": is_traditional_breakout,
+        "is_cheat_breakout": is_cheat_breakout,
         "is_false_breakout": is_false_breakout,
         "breakout_vol_ratio": breakout_vol_ratio,
     }

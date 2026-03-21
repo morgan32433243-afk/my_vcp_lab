@@ -13,7 +13,14 @@ import requests
 import time
 import math
 from collections import defaultdict
-from vcp_analyzer import analyze_vcp
+from vcp_analyzer import analyze_vcp, format_vcp_amount
+import json
+
+# Session-based cache to avoid API limits during manual queries
+fundamental_cache = {
+    "revenue": {}, # ticker -> (yoy, accel, msg)
+    "eps":     {}  # ticker -> (yoy, margins, msg)
+}
 
 
 # ============================================================
@@ -52,14 +59,15 @@ def get_market_status():
 
 
 # ============================================================
-# RS Rating 計算 (全市場相對強度 Percentile Rank)
+# RS Rating 計算 (全市場相對強度 Percentile Rank) - 加權版
 # ============================================================
-RS_CACHE_FILE = f"rs_cache_{datetime.now().strftime('%Y-%m-%d')}.json"
+RS_CACHE_FILE = f"rs_weighted_cache_{datetime.now().strftime('%Y-%m-%d')}.json"
 
 def calculate_rs_ratings(tickers):
     """
-    批次下載全市場 1 年期收益率，並對每一檔計算 Percentile Rank (0~100)。
-    結果快取至當日的 rs_cache_YYYY-MM-DD.json，同一天重複執行直接讀取，不重算。
+    批次下載全市場 1 年期數據，並計算加權 RS (0~100 Percentile)。
+    公式：(C0/C63 * 0.4) + (C0/C126 * 0.2) + (C0/C189 * 0.2) + (C0/C250 * 0.2)
+    結果快取至當日的 rs_weighted_cache_YYYY-MM-DD.json。
     回傳 dict: { ticker: rs_score }
     """
     import json, glob
@@ -95,15 +103,27 @@ def calculate_rs_ratings(tickers):
                     try:
                         closes = df[t]['Close'].dropna()
                         if len(closes) > 50:
-                            ret = (closes.iloc[-1] / closes.iloc[0] - 1) * 100
-                            batch[t] = float(ret)
+                            c0 = closes.iloc[-1]
+                            c63 = closes.iloc[-64] if len(closes) > 63 else closes.iloc[0]
+                            c126 = closes.iloc[-127] if len(closes) > 126 else closes.iloc[0]
+                            c189 = closes.iloc[-190] if len(closes) > 189 else closes.iloc[0]
+                            c250 = closes.iloc[-251] if len(closes) > 250 else closes.iloc[0]
+                            
+                            raw_rs = (c0 / c63 * 0.4) + (c0 / c126 * 0.2) + (c0 / c189 * 0.2) + (c0 / c250 * 0.2)
+                            batch[t] = float(raw_rs)
                     except Exception:
                         pass
             else:
                 closes = df['Close'].dropna()
                 if len(closes) > 50 and len(chunk) == 1:
-                    ret = (closes.iloc[-1] / closes.iloc[0] - 1) * 100
-                    batch[chunk[0]] = float(ret)
+                    c0 = closes.iloc[-1]
+                    c63 = closes.iloc[-64] if len(closes) > 63 else closes.iloc[0]
+                    c126 = closes.iloc[-127] if len(closes) > 126 else closes.iloc[0]
+                    c189 = closes.iloc[-190] if len(closes) > 189 else closes.iloc[0]
+                    c250 = closes.iloc[-251] if len(closes) > 250 else closes.iloc[0]
+                    
+                    raw_rs = (c0 / c63 * 0.4) + (c0 / c126 * 0.2) + (c0 / c189 * 0.2) + (c0 / c250 * 0.2)
+                    batch[chunk[0]] = float(raw_rs)
         except Exception:
             pass
         time.sleep(0.5)
@@ -216,11 +236,34 @@ def load_revenue_cache():
 
 
 # ============================================================
-# FinMind Lazy Fetcher (僅對技術面過關的股票呼叫)
+# FinMind API 與本地快取雙軌並行 (先 API，再本地)
 # ============================================================
+local_revenue_cache = None
+
 def get_revenue_yoy(ticker_symbol):
-    """最新單月營收 YoY，並判斷是否具備加速性 (本月 YoY > 上月 YoY)"""
+    """最新單月營收 YoY (優先呼叫 FinMind API，若達上限則讀取本地 taiwan_revenue.csv)"""
+    global local_revenue_cache
+    if ticker_symbol in fundamental_cache["revenue"]:
+        return fundamental_cache["revenue"][ticker_symbol]
+
     stock_id = ticker_symbol.split('.')[0]
+    result = _fetch_revenue_api(stock_id)
+    
+    if result[2] == "LIMIT_EXCEEDED":
+        # 讀取本地快取作為備案
+        if local_revenue_cache is None:
+            local_revenue_cache = load_revenue_cache()
+            
+        if stock_id in local_revenue_cache:
+            yoy = local_revenue_cache[stock_id]
+            return yoy, False, f"近月 YoY:{yoy:.1f}% (本地資料)"
+            
+    if result[2] != "LIMIT_EXCEEDED" and result[2] != "API 異常":
+        fundamental_cache["revenue"][ticker_symbol] = result
+        
+    return result
+
+def _fetch_revenue_api(stock_id):
     start_date = (date.today() - timedelta(days=450)).strftime('%Y-%m-%d')
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {"dataset": "TaiwanStockMonthRevenue", "data_id": stock_id, "start_date": start_date}
@@ -252,11 +295,17 @@ def get_revenue_yoy(ticker_symbol):
 
 
 def get_eps_and_margins(ticker_symbol):
-    """
-    從 FinMind 取得最近一季 EPS YoY 與三率 (毛利、營利、淨利) 是否較去年同期成長。
-    回傳 (eps_yoy, margins_improving, msg)
-    """
+    """從 FinMind 取得最近一季 EPS YoY 與三率成長"""
+    if ticker_symbol in fundamental_cache["eps"]:
+        return fundamental_cache["eps"][ticker_symbol]
+
     stock_id = ticker_symbol.split('.')[0]
+    result = _fetch_eps_api(stock_id)
+    if result[2] != "LIMIT_EXCEEDED":
+        fundamental_cache["eps"][ticker_symbol] = result
+    return result
+
+def _fetch_eps_api(stock_id):
     start_date = (date.today() - timedelta(days=600)).strftime('%Y-%m-%d')
     url = "https://api.finmindtrade.com/api/v4/data"
     params = {"dataset": "TaiwanStockFinancialStatements", "data_id": stock_id, "start_date": start_date}
@@ -271,22 +320,26 @@ def get_eps_and_margins(ticker_symbol):
         df = pd.DataFrame(data)
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date')
-        # 建立季度財報索引
         eps_data = df[df['type'] == 'EPS'].tail(8)
-        gp_data  = df[df['type'] == 'GrossProfit'].tail(8)     # 毛利率 proxy
-        op_data  = df[df['type'] == 'OperatingIncome'].tail(8)  # 營業利益
-        ni_data  = df[df['type'] == 'NetIncome'].tail(8)        # 淨利
+        gp_data  = df[df['type'] == 'GrossProfit']     
+        op_data  = df[df['type'] == 'OperatingIncome']
+        ni_data  = df[df['type'] == 'NetIncome']
         if len(eps_data) < 2:
             return None, None, "EPS 數據不足"
         latest_eps = float(eps_data.iloc[-1]['value'])
         prev_eps   = float(eps_data.iloc[-2]['value'])
         eps_yoy = ((latest_eps - prev_eps) / abs(prev_eps) * 100) if prev_eps != 0 else None
-        # 三率：只要最新 > 前一期即視為成長
+        
         def is_improving(sdf):
-            if len(sdf) < 2: return True  # 缺數據則放行
+            if len(sdf) < 2: return True 
             return float(sdf.iloc[-1]['value']) > float(sdf.iloc[-2]['value'])
+            
         margins_improving = is_improving(gp_data) and is_improving(op_data) and is_improving(ni_data)
-        msg = f"EPS YoY:{eps_yoy:.1f}% | 三率{'✅成長' if margins_improving else '❌退步'}" if eps_yoy is not None else "EPS 計算異常"
+        
+        # 格式化季度顯示
+        d = eps_data.iloc[-1]['date']
+        quarter = (d.month - 1) // 3 + 1
+        msg = f"{d.year}Q{quarter} EPS:{latest_eps:.2f} YoY:{eps_yoy:.1f}% | 三率{'✅成長' if margins_improving else '❌退步'}"
         return eps_yoy, margins_improving, msg
     except Exception:
         return None, None, "API 異常"
@@ -519,10 +572,16 @@ def batch_scan_vcp(
             "status":          vcp_label,
             "total_score":     total_score,
             # 突破訊號
-            "pivot_point":     result.get("pivot_point"),
-            "is_breakout":     result.get("is_breakout", False),
-            "is_false_breakout": result.get("is_false_breakout", False),
-            "breakout_vol_ratio": result.get("breakout_vol_ratio", 0),
+            "cheat_pivot":     result.get("cheat_pivot"),
+            "base_high":       result.get("base_high"),
+            "is_traditional_breakout": result.get("is_traditional_breakout", False),
+            "is_cheat_breakout":       result.get("is_cheat_breakout", False),
+            "is_false_breakout":       result.get("is_false_breakout", False),
+            "today_vol":               result.get("today_vol", 0),
+            "today_amount":            result.get("today_amount", 0),
+            "avg_amount_20":           result.get("avg_amount_20", 0),
+            "vol_20_ma":               result.get("vol_20_ma", 0),
+            "breakout_vol_ratio":      result.get("breakout_vol_ratio", 0),
         })
         print(f"🏆 股票 {ticker} 通過全部濾網！得分: {total_score:.1f} / 100，標註為 '{vcp_label}'")
 
@@ -530,20 +589,30 @@ def batch_scan_vcp(
 
     # ==================== 輸出最終戰報 ====================
     if ultimate_picks:
-        ultimate_picks.sort(key=lambda x: x["total_score"], reverse=True)
         industry_groups = defaultdict(list)
         for pick in ultimate_picks:
             ind = ticker_industry_map.get(pick['ticker'], "未知產業") if ticker_industry_map else "未知產業"
             industry_groups[ind].append(pick)
             
+        # 🚀 族群性過濾器 (Sector Clustering)
+        for industry, picks in industry_groups.items():
+            if len(picks) >= 3:
+                for pick in picks:
+                    pick['total_score'] = round(pick['total_score'] * 1.2, 1)
+                    pick['status'] = f"{pick['status']} [族群🔥]"
+
         print("\n" + "="*80)
         print("🏆 今日全市場最優選 (依產業分類，得分由高到低):")
         print("="*80)
         
         tv_watchlist = []
-        for industry, picks in industry_groups.items():
+        # 將產業依照最高得分的股票進行排序
+        sorted_industries = sorted(industry_groups.items(), key=lambda item: max(p["total_score"] for p in item[1]), reverse=True)
+
+        for industry, picks in sorted_industries:
             picks.sort(key=lambda x: x["total_score"], reverse=True)
-            print(f"\n📂 【{industry}】 (共 {len(picks)} 檔)")
+            cluster_tag = " 🔥聚落形成 (綜合評分+20%)" if len(picks) >= 3 else ""
+            print(f"\n📂 【{industry}】 (共 {len(picks)} 檔){cluster_tag}")
             print("-" * 60)
             for pick in picks:
                 t = pick['ticker']
@@ -552,12 +621,16 @@ def batch_scan_vcp(
                 eps_str = f"{pick['eps_yoy']:.1f}%" if pick.get('eps_yoy') is not None else "N/A"
                 accel_str = "🚀" if pick.get('is_accel') else ""
                 # 突破狀態標註
-                if pick.get('is_breakout'):
-                    pivot_str = f"🚀 已突破! 放量{pick['breakout_vol_ratio']*100:.0f}% Pivot:{pick['pivot_point']:.2f}"
+                if pick.get('is_traditional_breakout'):
+                    pivot_str = f"🚀 強勢突破大底! 成交量{format_vcp_amount(pick['today_amount'])} / {pick['today_vol']:,.0f}張 ({pick['breakout_vol_ratio']*100:.0f}%) BaseHigh:{pick['base_high']:.2f}"
+                elif pick.get('is_cheat_breakout'):
+                    pivot_str = f"🎯 中繼作弊點 (Cheat) 觸發! 成交量{format_vcp_amount(pick['today_amount'])} / {pick['today_vol']:,.0f}張 ({pick['breakout_vol_ratio']*100:.0f}%) CheatPivot:{pick['cheat_pivot']:.2f}"
                 elif pick.get('is_false_breakout'):
-                    pivot_str = f"⚠️  假突破 Pivot:{pick['pivot_point']:.2f}"
+                    pivot_str = f"⚠️  假突破 CP:{pick['cheat_pivot']:.2f}"
                 else:
-                    pivot_str = f"⏳ 等待突破 Pivot:{pick['pivot_point']:.2f}" if pick.get('pivot_point') else ""
+                    cv = pick.get('cheat_pivot') or 0
+                    bh = pick.get('base_high') or 0
+                    pivot_str = f"⏳ 尚未突破 CP:{cv:.2f} BH:{bh:.2f} (量:{format_vcp_amount(pick['today_amount'])} / {pick['today_vol']:,.0f}張)"
                 print(
                     f"🔹 {t:<10} {name:<6} | 股價:{pick['current_price']:<7.2f} | "
                     f"VCP:{pick['vcp_pct']:.2f}% | RS:{pick['rs_score']:.0f} | "
@@ -742,8 +815,16 @@ if __name__ == "__main__":
                 ind  = ticker_industry_map.get(search_ticker, '未知產業')
                 print(f"\n🏷️ 查詢標的：{search_ticker} {name} ({ind})")
 
-            analyze_vcp(search_ticker, silent=False)
-            print("  👴🏿 祝您發大財！👴🏿\n")
+            # 抓取基本面資訊 (優先使用 Session 暫存)
+            is_cached = (search_ticker in fundamental_cache["revenue"]) or (search_ticker in fundamental_cache["eps"])
+            if not is_cached:
+                print(f"📡 正在從 FinMind 抓取 {search_ticker} 的基本面數據...")
+
+            rv_info = get_revenue_yoy(search_ticker)
+            ep_info = get_eps_and_margins(search_ticker)
+
+            analyze_vcp(search_ticker, silent=False, revenue_info=rv_info, eps_info=ep_info)
+            print("  👴🏿 祝尼發大財！👴🏿\n")
 
 
 

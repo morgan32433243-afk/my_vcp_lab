@@ -1,4 +1,6 @@
-yfinance
-FinMind
-pandas
 streamlit
+yfinance
+pandas
+matplotlib
+requests
+lxml
