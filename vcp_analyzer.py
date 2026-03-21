@@ -13,6 +13,43 @@ os.environ['PYTHONHTTPSVERIFY'] = '0'
 # 隱藏所有警告，包括 matplotlib 的字體警告
 warnings.filterwarnings('ignore')
 
+def calculate_recent_pullbacks(df, lookback=120, order=5):
+    """
+    計算最近幾波的回檔深度 (波峰到波谷)
+    order: 波峰/波谷的左右區間大小
+    """
+    if len(df) < lookback:
+        df_recent = df
+    else:
+        df_recent = df.iloc[-lookback:]
+        
+    highs = df_recent['High'].values
+    lows = df_recent['Low'].values
+    
+    peaks = []
+    for i in range(order, len(highs) - order):
+        if all(highs[i] >= highs[i-order:i]) and all(highs[i] >= highs[i+1:i+order+1]):
+            peaks.append((i, highs[i]))
+            
+    pullbacks = []
+    for j in range(len(peaks)):
+        peak_idx, peak_val = peaks[j]
+        next_peak_idx = peaks[j+1][0] if j + 1 < len(peaks) else len(highs)
+        
+        segment_lows = lows[peak_idx:next_peak_idx]
+        if len(segment_lows) > 0:
+            min_low = min(segment_lows)
+            drop_pct = (peak_val - min_low) / peak_val * 100
+            pullbacks.append(drop_pct)
+            
+    recent_3 = pullbacks[-3:] if len(pullbacks) >= 3 else pullbacks
+    
+    is_decreasing = False
+    if len(recent_3) >= 2:
+        is_decreasing = all(recent_3[i] > recent_3[i+1] for i in range(len(recent_3)-1))
+        
+    return recent_3, is_decreasing
+
 def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
     original_ticker = ticker_symbol
     # 抓取數據：使用 yfinance 抓取單一美股或台股過去 250 天的歷史數據。
@@ -68,6 +105,9 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
             if not silent: print(f"錯誤: 無法抓取 {ticker_symbol} 的數據。請檢查股票代碼是否正確。")
             return None # 返回 None 表示失敗
 
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.droplevel(1)
+
     # 確保有足夠的數據來計算 200MA 和平均成交量
     if len(data) < 200:
         if not silent: print(f"數據不足以計算移動平均線，目前只有 {len(data)} 天數據。")
@@ -80,6 +120,11 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
     data['Vol_5_MA'] = data['Volume'].rolling(window=5).mean() # 近5日平均成交量
     data['Vol_20_MA'] = data['Volume'].rolling(window=20).mean() # 近20日平均成交量
 
+    # 計算成交額、5日與50日均成交額 (雙軌流動性)
+    data['Turnover'] = data['Close'] * data['Volume']
+    data['Turnover_5_MA'] = data['Turnover'].rolling(window=5).mean()
+    data['Turnover_50_MA'] = data['Turnover'].rolling(window=50).mean()
+
     # 獲取最新的數據點並明確提取為純數值
     latest_close = data['Close'].iloc[-1].item()
     latest_200MA = data['200MA'].iloc[-1].item()
@@ -87,6 +132,11 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
     latest_50MA = data['50MA'].iloc[-1].item()
     latest_vol_5_ma = data['Vol_5_MA'].iloc[-1].item()
     latest_vol_20_ma = data['Vol_20_MA'].iloc[-1].item()
+    latest_turnover_50_ma = data['Turnover_50_MA'].iloc[-1].item()
+    latest_turnover_5_ma = data['Turnover_5_MA'].iloc[-1].item()
+
+    # 計算流動性
+    is_liquid = (latest_turnover_50_ma > 30_000_000) and (latest_turnover_5_ma > 50_000_000)
 
     # 取得 5 日前的收盤價，用於買盤動能判斷
     price_5_days_ago = None
@@ -99,14 +149,17 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
         if not silent: print("移動平均線、成交量或價格數據不足以進行完整分析。")
         return None # 返回 None 表示數據不足
 
-    # 計算 250 日最高價
+    # 計算 250 日最高/最低價
     highest_250_day_price = data['High'].iloc[-250:].max().item()
+    lowest_250_day_price = data['Low'].iloc[-250:].min().item()
+
+    # 計算 20天前的 200MA
+    ma200_series = data['200MA'].dropna()
+    ma200_20_days_ago = ma200_series.iloc[-20].item() if len(ma200_series) >= 20 else None
 
     # 現在比較的是純數字，不會有 Series 標籤對齊問題
-    # 新增相對強度檢查：當前價格在 250 日最高價的 25% 範圍內 (即 >= 75% 最高價)
-    is_uptrend = (latest_close > latest_200MA) and \
-                 (latest_150MA > latest_200MA) and \
-                 (latest_close >= highest_250_day_price * 0.75)
+    # 嚴格趨勢檢查：確保符合 Close > 50MA > 150MA > 200MA 的多頭排列
+    is_uptrend = (latest_close > latest_50MA > latest_150MA > latest_200MA)
 
     if not silent:
         if not is_uptrend:
@@ -126,7 +179,9 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
 
     # VCP 型態偵測：找出過去 20 個交易日內，價格波動（High-Low 的百分比）是否呈現逐漸縮小的趨勢（收縮型態）。
     # 計算每日波動百分比
+    import numpy as np
     data['Volatility'] = ((data['High'] - data['Low']) / data['Close']) * 100
+    data['Volatility'] = data['Volatility'].replace([np.inf, -np.inf], np.nan).fillna(0)
 
     # 考慮過去 20 個交易日的波動數據
     last_20_days_volatility = data['Volatility'].iloc[-20:].dropna()
@@ -148,6 +203,25 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
 
     # 目前的波動百分比
     current_volatility_percentage = last_20_days_volatility.iloc[-1]
+
+    # 計算 Volume Dry Up (VDU)
+    # 在最後一次收縮處，成交量必須低於過去 20 天平均量的 50%
+    is_vdu = False
+    vdu_vol_ratio = None
+    if contraction_points:
+        last_contraction_date, _ = contraction_points[-1]
+        if last_contraction_date in data.index:
+            last_vol = data['Volume'].loc[last_contraction_date]
+            last_vol_20ma = data['Vol_20_MA'].loc[last_contraction_date]
+            if hasattr(last_vol, "item"): last_vol = last_vol.item()
+            if hasattr(last_vol_20ma, "item"): last_vol_20ma = last_vol_20ma.item()
+            if not pd.isna(last_vol) and not pd.isna(last_vol_20ma) and last_vol_20ma > 0:
+                vdu_vol_ratio = last_vol / last_vol_20ma
+                if vdu_vol_ratio < 0.5:
+                    is_vdu = True
+
+    # 計算最近三波的回檔深度並驗證遞減規則
+    recent_pullbacks, pullbacks_decreasing = calculate_recent_pullbacks(data)
 
     if not silent:
         # 顯示結果：列印出計算出的收縮次數（T）與目前的波動百分比。
@@ -177,16 +251,58 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
             print("⭐⭐⭐" * 5 + "\n")
 
         # 最後輸出一句：祝劉先生在投資路上穩定獲利！
-        print("\n祝劉先生在投資路上穩定獲利！")
+    results = {
+        "ticker": ticker_symbol,
+        "is_vdu": is_vdu,
+        "vdu_vol_ratio": vdu_vol_ratio,
+        "recent_pullbacks": recent_pullbacks,
+        "pullbacks_decreasing": pullbacks_decreasing,
+        "current_price": latest_close,
+        "ma150": latest_150MA,
+        "avg_volume": latest_vol_20_ma,
+        "vol_5_ma": latest_vol_5_ma,
+        "vol_20_ma": latest_vol_20_ma,
+        "price_5_days_ago": price_5_days_ago,
+        "current_volatility_percentage": current_volatility_percentage,
+        "t_count": T_count,
+        "is_uptrend": is_uptrend,
+        "is_liquid": is_liquid,
+        "is_safe_liquidity": is_liquid,
+        "highest_250_day_price": highest_250_day_price,
+        "lowest_250_day_price": lowest_250_day_price,
+        "ma50": latest_50MA,
+        "ma200": latest_200MA,
+        "ma200_20_days_ago": ma200_20_days_ago,
+        "turnover_5_ma": latest_turnover_5_ma,
+        "turnover_50_ma": latest_turnover_50_ma
+    }
 
-    # 繪圖功能
-    if not data.empty and output_filename: # 只有在提供檔名時才繪圖
-        fig, ax = plt.subplots(figsize=(12, 7))
+    # 繪圖引擎：由外部決定是否傳入 output_filename，有傳入即無條件繪圖
+    if output_filename and not data.empty:
+        # 只有符合條件才執行繪圖
+        fig, (ax_price, ax_vol) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
 
-        ax.plot(data.index, data['Close'], label='Close Price', color='black', linewidth=1.5)
-        ax.plot(data.index, data['50MA'], label='50MA', color='blue', linestyle='--')
-        ax.plot(data.index, data['150MA'], label='150MA', color='orange', linestyle='--')
-        ax.plot(data.index, data['200MA'], label='200MA', color='red', linestyle='--')
+        ax_price.plot(data.index, data['Close'], label='Close Price', color='black', linewidth=1.5)
+        ax_price.plot(data.index, data['50MA'], label='50MA', color='blue', linestyle='--')
+        ax_price.plot(data.index, data['150MA'], label='150MA', color='orange', linestyle='--')
+        ax_price.plot(data.index, data['200MA'], label='200MA', color='red', linestyle='--')
+
+        # VCP 收縮三角形視覺化
+        if contraction_points:
+            start_date = contraction_points[0][0]
+            end_date = data.index[-1]
+            vcp_data = data.loc[start_date:end_date]
+            if len(vcp_data) > 1:
+                x_coords = [start_date, end_date]
+                
+                max_high = vcp_data['High'].max()
+                min_low = vcp_data['Low'].min()
+                if hasattr(max_high, "item"): max_high = max_high.item()
+                if hasattr(min_low, "item"): min_low = min_low.item()
+                
+                y_upper = [max_high, latest_close]
+                y_lower = [min_low, latest_close]
+                ax_price.fill_between(x_coords, y_lower, y_upper, color='gray', alpha=0.2, lw=0)
 
         # 標註最後三波收縮區間
         if len(contraction_points) >= 3:
@@ -195,39 +311,50 @@ def analyze_vcp(ticker_symbol, output_filename=None, silent=False):
             # 從最舊的收縮點開始標註
             for i, (date, vol_pct) in enumerate(last_three_contraction_points):
                 # 為了標註一整天，我們從收縮日期的開始到結束
-                ax.axvspan(date - timedelta(hours=12), date + timedelta(hours=12), color='lightgreen', alpha=0.3, lw=0)
+                ax_price.axvspan(date - timedelta(hours=12), date + timedelta(hours=12), color='lightgreen', alpha=0.3, lw=0)
                 # 在日期附近標註百分比，稍微偏移以避免重疊
-                ax.text(date, ax.get_ylim()[1] * (0.95 - i*0.02), f"{vol_pct:.2f}%", 
+                ax_price.text(date, ax_price.get_ylim()[1] * (0.95 - i*0.02), f"{vol_pct:.2f}%", 
                         color='darkgreen', fontsize=9, ha='center', va='top')
             
-        ax.set_title(f"{ticker_symbol} Price Trend and VCP Analysis", fontsize=16)
-        ax.set_xlabel("Date", fontsize=12)
-        ax.set_ylabel("Price", fontsize=12)
-        ax.legend(loc='upper left')
-        ax.grid(True, linestyle='--', alpha=0.6)
+        ax_price.set_title(f"{ticker_symbol} Price Trend and VCP Analysis", fontsize=16)
+        ax_price.set_ylabel("Price", fontsize=12)
+        ax_price.legend(loc='upper left')
+        ax_price.grid(True, linestyle='--', alpha=0.6)
+
+        # 繪製成交量子圖 (紅漲綠跌)
+        if 'Open' in data.columns:
+            colors = ['red' if c >= o else 'green' for c, o in zip(data['Close'], data['Open'])]
+        else:
+            colors = ['red' if i == 0 or data['Close'].iloc[i] >= data['Close'].iloc[i-1] else 'green' for i in range(len(data))]
+            
+        ax_vol.bar(data.index, data['Volume'], color=colors, alpha=0.7)
+        ax_vol.set_ylabel("Volume", fontsize=12)
+        ax_vol.set_xlabel("Date", fontsize=12)
+        ax_vol.grid(True, linestyle='--', alpha=0.6)
+
+        # 若為 VDU 狀態，在最後一次收縮處標記 VDU (量縮窒息)
+        if is_vdu and contraction_points:
+            vdu_date = contraction_points[-1][0]
+            if vdu_date in data.index:
+                vdu_vol = data['Volume'].loc[vdu_date]
+                if hasattr(vdu_vol, "item"): vdu_vol = vdu_vol.item()
+                ax_vol.annotate('VDU', xy=(vdu_date, vdu_vol), xytext=(0, 25),
+                                textcoords='offset points', ha='center', va='bottom',
+                                arrowprops=dict(facecolor='blue', shrink=0.05, width=1.5, headwidth=6),
+                                fontsize=10, color='blue', fontweight='bold',
+                                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="blue", alpha=0.8))
 
         # 格式化x軸日期
         fig.autofmt_xdate()
 
         plt.tight_layout()
         plt.savefig(output_filename)
-        plt.close()
+        plt.clf()
+        plt.close('all')
+        import gc; gc.collect()
         if not silent: print(f"\n股價走勢圖已儲存為 {output_filename}")
-
-    # 返回分析結果
-    return {
-        "ticker": ticker_symbol,
-        "current_price": latest_close,
-        "ma150": latest_150MA,
-        "avg_volume": latest_vol_20_ma, # 將 avg_volume 更新為 latest_vol_20_ma (20日平均成交量)
-        "vol_5_ma": latest_vol_5_ma,
-        "vol_20_ma": latest_vol_20_ma,
-        "price_5_days_ago": price_5_days_ago,
-        "current_volatility_percentage": current_volatility_percentage,
-        "t_count": T_count,
-        "is_uptrend": is_uptrend,
-        "highest_250_day_price": highest_250_day_price # 將 250 日最高價加入結果
-    }
+        
+    return results
 
 if __name__ == "__main__":
     while True:
