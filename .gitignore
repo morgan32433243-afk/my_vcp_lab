@@ -1,1 +1,7 @@
 .aider*
+
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*_cache_*.json

@@ -13,7 +13,7 @@ import requests
 import time
 import math
 from collections import defaultdict
-from vcp_analyzer import analyze_vcp, format_vcp_amount
+from VCP技術分析核心 import analyze_vcp, format_vcp_amount
 import json
 
 # Session-based cache to avoid API limits during manual queries
@@ -430,8 +430,8 @@ def batch_scan_vcp(
                 import importlib, sys
                 # 動態載入同資料夾下的 update_revenue.py
                 spec = importlib.util.spec_from_file_location(
-                    "update_revenue",
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "update_revenue.py")
+                    "營收資料同步",
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "營收資料同步.py")
                 )
                 ur = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(ur)
@@ -882,6 +882,37 @@ if __name__ == "__main__":
 
             rv_info = get_revenue_yoy(search_ticker)
             ep_info = get_eps_and_margins(search_ticker)
+
+            # --- 計算個股 RS Score（加權版絕對分數，無需全市場比較）---
+            try:
+                import yfinance as yf
+                _end = datetime.now()
+                _start = _end - timedelta(days=380)
+                import io, contextlib
+                _buf = io.StringIO()
+                with contextlib.redirect_stderr(_buf):
+                    _df = yf.download(search_ticker, start=_start, end=_end, progress=False)
+                if isinstance(_df.columns, pd.MultiIndex):
+                    _df.columns = _df.columns.droplevel(1)
+                _closes = _df['Close'].dropna() if not _df.empty else pd.Series()
+                if len(_closes) > 60:
+                    c0   = float(_closes.iloc[-1])
+                    c63  = float(_closes.iloc[-64])  if len(_closes) > 63  else float(_closes.iloc[0])
+                    c126 = float(_closes.iloc[-127]) if len(_closes) > 126 else float(_closes.iloc[0])
+                    c189 = float(_closes.iloc[-190]) if len(_closes) > 189 else float(_closes.iloc[0])
+                    c250 = float(_closes.iloc[-251]) if len(_closes) > 250 else float(_closes.iloc[0])
+                    raw_rs = (c0/c63*0.4) + (c0/c126*0.2) + (c0/c189*0.2) + (c0/c250*0.2)
+                    p3m  = (c0 / c63  - 1) * 100
+                    p6m  = (c0 / c126 - 1) * 100
+                    p12m = (c0 / c250 - 1) * 100
+                    rs_label = "🚀 強勢" if raw_rs >= 1.15 else ("✅ 偏強" if raw_rs >= 1.02 else ("⚠️ 偏弱" if raw_rs >= 0.95 else "❌ 弱勢"))
+                    print(f"\n📊 相對強度 (RS) 分析:")
+                    print(f"  {rs_label} RS加權分數: {raw_rs:.4f}  (>1.10 為強勢，<1.00 為弱勢)")
+                    print(f"  3月漲幅: {p3m:+.1f}%  |  6月漲幅: {p6m:+.1f}%  |  12月漲幅: {p12m:+.1f}%")
+                else:
+                    print("\n📊 相對強度 (RS) 分析: 數據不足，無法計算")
+            except Exception:
+                print("\n📊 相對強度 (RS) 分析: 計算失敗")
 
             analyze_vcp(search_ticker, silent=False, revenue_info=rv_info, eps_info=ep_info)
             print("  👴🏿 祝尼發大財！👴🏿\n")
